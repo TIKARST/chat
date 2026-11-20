@@ -659,6 +659,8 @@ def _extract_cli_args_for_script(skill_name: str, script_rel: str, user_query: s
             jq_m = re.search(r"(冬至|小寒|大寒|立春|雨水|惊蛰|春分|清明|谷雨|立夏|小满|芒种|夏至|小暑|大暑|立秋|处暑|白露|秋分|寒露|霜降|立冬|小雪|大雪)", q)
             if jq_m:
                 return ["--pillars", " ".join(pillars[:4]), "--jieqi", jq_m.group(1)]
+            logger.info("奇門排盤缺少節氣參數（如小暑/冬至），跳過腳本預執行")
+            return None
         if dt_match and "农历" not in q and "農曆" not in q:
             y, m, d, hh, mm = dt_match.groups()
             dt_str = f"{int(y):04d}-{int(m):02d}-{int(d):02d} {int(hh or 12):02d}:{int(mm or 0):02d}"
@@ -685,7 +687,6 @@ def run_skill_scripts(skill: Any, user_query: str) -> str:
     if not scripts:
         return ""
 
-    # 強制子行程使用 UTF-8，避免 Windows 下 stdout 預設 cp936 導致中文變亂碼
     child_env = os.environ.copy()
     child_env["PYTHONUTF8"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
@@ -719,6 +720,34 @@ def run_skill_scripts(skill: Any, user_query: str) -> str:
     return "\n\n".join(outputs)
 
 
+def stage_chart_for_query(user_query: str) -> Tuple[Optional[str], str]:
+    """
+    第一批：當輸入命中排盤類 Skill 且具備可執行的四柱/時間/坐向參數時，
+    先跑腳本产出精確盤面並暫存，停在核對階段，等用戶點擊【提交分析】再進模型。
+    """
+    matched_skills = find_matching_skills(user_query)
+    if not matched_skills:
+        return None, ""
+
+    staged_blocks: List[str] = []
+    matched_names: List[str] = []
+    for s in matched_skills:
+        script_out = run_skill_scripts(s, user_query)
+        if script_out:
+            matched_names.append(s.name)
+            staged_blocks.append(script_out)
+
+    if not staged_blocks:
+        return None, ""
+
+    staged_text = (
+        f"### 【第一批暂存排盘结果（Skill: {'、'.join(matched_names)}）】\n"
+        + "\n\n".join(staged_blocks)
+    )
+    tip = "✅ 排盘已完成并暂存。请核对盘面参数；确认无误后点击【提交分析】开始推演。"
+    return staged_text, tip
+
+
 def generate_response(
     history: Optional[List[dict]],
     raw_path: str,
@@ -732,6 +761,7 @@ def generate_response(
     cloud_url: str,
     cloud_key: str,
     cloud_model: str,
+    staged_chart: str = "",
 ):
     history = list(history or [])
     if not history or history[-1].get("role") != "user":
@@ -772,8 +802,15 @@ def generate_response(
             f"```{lang or ''}\n{numbered_code}\n```"
         )
 
-    # 2. 自動檢索並注入匹配的專業 Skill（含 references 字典與 scripts 腳本計算結果）
-    matched_skills = find_matching_skills(user_query)
+    # 2. 自動檢索並注入匹配的專業 Skill
+    # 僅在點擊【提交分析】按鈕時才結合 staged_chart 匹配；普通新提問只根據當前 user_query 匹配
+    is_staged_submit = (
+        bool((staged_chart or "").strip())
+        and "提交分析" in user_query
+    )
+    matched_skills = find_matching_skills(
+        f"{user_query} {staged_chart}" if is_staged_submit else user_query
+    )
     matched_names = ""
     script_blocks: List[str] = []
     if matched_skills:
@@ -783,6 +820,8 @@ def generate_response(
 
         for s in matched_skills:
             skill_text = s.prompt_template.strip() if s.prompt_template else (s.description or "")
+            if is_staged_submit and len(skill_text) > 3500:
+                skill_text = skill_text[:3500] + "\n...（已按分批上下文预算精简规则）"
             prompt_parts.append(
                 f"### 【已挂载专业技能知识库与推演体系：{s.name}】\n"
                 f"> **技能定位**：{s.description}\n\n"
@@ -791,16 +830,17 @@ def generate_response(
             )
 
             refs = getattr(s, "references", None) or {}
-            if refs:
+            if refs and not is_staged_submit:
                 ref_blocks = [
                     f"#### 参考字典 `{rel}`\n```markdown\n{body}\n```"
                     for rel, body in refs.items()
                 ]
                 prompt_parts.append("### 【配套参考字典】\n" + "\n\n".join(ref_blocks))
 
-            script_out = run_skill_scripts(s, user_query)
-            if script_out:
-                script_blocks.append(script_out)
+            if not is_staged_submit:
+                script_out = run_skill_scripts(s, user_query)
+                if script_out:
+                    script_blocks.append(script_out)
 
     # 3. 聯網資料（若有）
     if use_web or tech_only:
@@ -818,8 +858,13 @@ def generate_response(
                 f"{web_info}"
             )
 
-    # 4. 將腳本精確排盤結果置於提問正上方（距離模型輸出最近、權重最高）
-    if script_blocks:
+    # 4. 注入暂存盘面或脚本精確排盤結果
+    if is_staged_submit:
+        prompt_parts.append(
+            "### 【已核对暂存的排盘结果（唯一权威基准，请直接照抄，严禁自行心算篡改）】\n"
+            f"{staged_chart.strip()}"
+        )
+    elif script_blocks:
         prompt_parts.append(
             "### 【本地脚本精确排盘结果（唯一权威基准，请直接照抄，严禁自行心算篡改）】\n"
             + "\n\n".join(script_blocks)
@@ -833,8 +878,8 @@ def generate_response(
     if matched_skills:
         skill_sys_header = (
             f"你当前担任【{matched_names}】领域的权威专家与智能 Agent。\n"
-            f"你的核心职责：严格遵循用户上下文已挂载的专业推演体系、参考字典与本地脚本精确计算结果开展分析。\n"
-            f"若上下文中已提供【本地脚本精确排盘结果】，所有四柱、十神、长生、纳音、胎元、命宫、日空、大运顺序、飞星或九宫数据必须100%原样照抄，严禁自行推翻或编造。\n\n"
+            f"你的核心职责：严格遵循用户上下文已挂载的专业推演体系与已核对排盘结果开展分析。\n"
+            f"若上下文中已提供【已核对暂存的排盘结果】或【本地脚本精确排盘结果】，所有四柱、十神、长生、纳音、胎元、命宫、日空、大运顺序、飞星或九宫数据必须100%原样照抄，严禁自行推翻或编造。\n\n"
         )
         effective_sys_prompt = skill_sys_header + base_sys_prompt
     else:
@@ -865,14 +910,14 @@ def generate_response(
         history[-1]["content"] = partial
         yield (
             history,
-            code_preview_update,
-            file_status,
+            gr.skip(),
+            gr.skip(),
             gr.skip(),
             loading_hint,
-            gr.Button(interactive=False),
-            gr.Button(interactive=False),
-            "",
-            "",
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
+            gr.skip(),
         )
 
     final_reply = history[-1]["content"]

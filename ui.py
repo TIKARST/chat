@@ -29,6 +29,7 @@ class UIComponents:
     # 狀態管理
     candidate_code_state: gr.State
     syntax_err_state: gr.State
+    staged_chart_state: gr.State
 
     # 左側欄：檔案管理元件
     file_path_box: gr.Textbox
@@ -53,6 +54,7 @@ class UIComponents:
     chatbot: gr.Chatbot
     msg_box: gr.Textbox
     send_btn: gr.Button
+    submit_analysis_btn: gr.Button
     stop_btn: gr.Button
     clear_chat_btn: gr.Button
 
@@ -78,6 +80,7 @@ class UIComponents:
             self.cloud_url_box,
             self.cloud_key_box,
             self.cloud_model_box,
+            self.staged_chart_state,
         ]
 
     def get_gen_outputs(self) -> List[gr.components.Component]:
@@ -100,6 +103,7 @@ def build_ui() -> Tuple[gr.Blocks, UIComponents]:
     with gr.Blocks(title="Qwen3.5 本地/云端双模代码工作台") as demo:
         candidate_code_state = gr.State("")
         syntax_err_state = gr.State("")
+        staged_chart_state = gr.State("")
 
         gr.Markdown(
             f"## Qwen3.5 本地 / 云端双模代码工作台\n"
@@ -177,12 +181,15 @@ def build_ui() -> Tuple[gr.Blocks, UIComponents]:
                     height=480,
                 )
                 msg_box = gr.Textbox(
-                    placeholder="输入你的代码修改需求或粘贴技术文档链接（Enter 发送，Shift+Enter 换行）...",
+                    placeholder="输入你的代码修改需求、生辰/四柱（先排盘暂存）或粘贴技术文档链接...",
                     lines=2,
                     show_label=False,
                 )
                 with gr.Row():
                     send_btn = gr.Button("发送", variant="primary", scale=2)
+                    submit_analysis_btn = gr.Button(
+                        "提交分析", variant="secondary", scale=1, interactive=False
+                    )
                     stop_btn = gr.Button("停止生成", variant="stop", scale=1)
                     clear_chat_btn = gr.Button("清空对话", scale=1)
 
@@ -217,6 +224,7 @@ def build_ui() -> Tuple[gr.Blocks, UIComponents]:
         components = UIComponents(
             candidate_code_state=candidate_code_state,
             syntax_err_state=syntax_err_state,
+            staged_chart_state=staged_chart_state,
             file_path_box=file_path_box,
             start_line_box=start_line_box,
             end_line_box=end_line_box,
@@ -235,6 +243,7 @@ def build_ui() -> Tuple[gr.Blocks, UIComponents]:
             chatbot=chatbot,
             msg_box=msg_box,
             send_btn=send_btn,
+            submit_analysis_btn=submit_analysis_btn,
             stop_btn=stop_btn,
             clear_chat_btn=clear_chat_btn,
             apply_status_md=apply_status_md,
