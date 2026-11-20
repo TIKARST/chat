@@ -1,1 +1,5 @@
 .env
+.workbench_bak/
+skills/
+__pycache__/
+*.pyc

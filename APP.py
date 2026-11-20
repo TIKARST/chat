@@ -1,98 +1,214 @@
-import os
-import json
-import requests
+# -*- coding: utf-8 -*-
+"""
+app.py: 程式總入口，負責初始化、串接 UI 與 Backend 邏輯並啟動服務。
+"""
+
+from __future__ import annotations
+
+import sys
 import gradio as gr
-from dotenv import load_dotenv
-
-try:
-    from exa_py import Exa
-except ImportError:
-    Exa = None
-
-# 强行锁定从脚本同级目录加载 .env
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.join(BASE_DIR, ".env")
-load_dotenv(env_path, override=True)
-
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen3.5:9b"
-
-# 直接从环境变量获取 Key 并初始化
-EXA_API_KEY = os.getenv("EXA_API_KEY")
-exa = Exa(api_key=EXA_API_KEY) if (Exa and EXA_API_KEY) else None
-
-def search_web(query):
-    if not exa:
-        return "", ""
-    try:
-        # 使用最稳妥的调用方式，并设置合理的超时
-        res = exa.search(query, num_results=3, timeout=6)
-        results = getattr(res, "results", [])
-        if not results:
-            return "", ""
-        snippets = [f"- [{r.title}]({r.url}): {r.text}" for r in results if getattr(r, "text", None)]
-        web_text = "\n".join(snippets)
-        if web_text:
-            return web_text, "🌐 **[已成功通过 Exa 联网检索]**\n\n"
-    except Exception:
-        # 联网失败时静默降级，不抛出异常影响主流程
-        pass
-    return "", ""
-
-def chat_fn(message, history, use_web):
-    messages = []
-    for item in history[-4:]:
-        if isinstance(item, dict):
-            role = item.get("role", "user")
-            content = item.get("content", "")
-            if role in ["user", "assistant"] and content:
-                messages.append({"role": role, "content": str(content)})
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            if item[0]:
-                messages.append({"role": "user", "content": str(item[0])})
-            if item[1]:
-                messages.append({"role": "assistant", "content": str(item[1])})
-
-    prompt = message
-    prefix = ""
-    if use_web:
-        web_info, prefix = search_web(message)
-        if web_info:
-            prompt = f"请参考以下联网搜索资料回答问题，并在适当位置标注参考链接：\n\n{web_info}\n\n问题：{message}"
-
-    messages.append({"role": "user", "content": prompt})
-    
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "stream": True,
-        "options": {"num_ctx": 4096}
-    }
-
-    partial_text = prefix
-    yield partial_text  # 率先输出前缀，确保界面立刻有响应，绝不空白
-
-    try:
-        with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=60) as r:
-            if r.status_code != 200:
-                yield f"{partial_text}❌ Ollama 响应错误 (状态码 {r.status_code})"
-                return
-            for line in r.iter_lines():
-                if line:
-                    data = json.loads(line.decode("utf-8"))
-                    chunk = data.get("message", {}).get("content", "")
-                    if chunk:
-                        partial_text += chunk
-                        yield partial_text
-    except Exception as e:
-        yield f"{partial_text}\n❌ 请求 Ollama 失败：{e}"
-
-demo = gr.ChatInterface(
-    fn=chat_fn,
-    additional_inputs=[gr.Checkbox(label="开启 Exa 联网搜索", value=False)],
-    title="Qwen3.5-9B 极简工作台",
-    description="显存锁定 4K 上下文 | 保留最近 4 轮对话 | 支持自动降级联网检索"
+from config import (
+    CLOUD_MODEL,
+    MODEL_NAME,
+    NUM_CTX,
+    OLLAMA_URL,
+    SERVER_NAME,
+    SERVER_PORT,
+    logger,
 )
+from utils import (
+    append_user_message,
+    port_available,
+    prepare_autofix_prompt,
+    ui_apply_patch,
+    ui_clear_file,
+    ui_load_file,
+    ui_restore_backup,
+)
+from backend import generate_response, preflight
+from ui import UIComponents, build_ui
+from skill_manager import create_skill_router, skill_registry
+
+
+def bind_events(components: UIComponents) -> None:
+    """串接 UI 元件事件至後端邏輯與工具函式。"""
+    # 勾選「僅搜技術文檔」時自動同步勾選「開啟 Exa 聯網搜尋」
+    components.tech_web_cb.change(
+        fn=lambda checked: gr.Checkbox(value=True) if checked else gr.skip(),
+        inputs=[components.tech_web_cb],
+        outputs=[components.web_cb],
+        queue=False,
+    )
+
+    # 檔案載入與重設
+    components.load_btn.click(
+        fn=ui_load_file,
+        inputs=[
+            components.file_path_box,
+            components.start_line_box,
+            components.end_line_box,
+            components.backend_radio,
+        ],
+        outputs=[components.code_preview, components.file_status_md],
+    )
+    components.file_path_box.submit(
+        fn=ui_load_file,
+        inputs=[
+            components.file_path_box,
+            components.start_line_box,
+            components.end_line_box,
+            components.backend_radio,
+        ],
+        outputs=[components.code_preview, components.file_status_md],
+    )
+    components.clear_file_btn.click(
+        fn=ui_clear_file,
+        inputs=[],
+        outputs=[
+            components.file_path_box,
+            components.start_line_box,
+            components.end_line_box,
+            components.code_preview,
+            components.file_status_md,
+            components.diff_preview,
+            components.apply_status_md,
+            components.apply_btn,
+            components.autofix_btn,
+            components.candidate_code_state,
+            components.syntax_err_state,
+        ],
+    )
+
+    # 安全寫入與備份還原
+    components.apply_btn.click(
+        fn=ui_apply_patch,
+        inputs=[
+            components.file_path_box,
+            components.start_line_box,
+            components.end_line_box,
+            components.candidate_code_state,
+            components.backend_radio,
+        ],
+        outputs=[
+            components.code_preview,
+            components.file_status_md,
+            components.apply_status_md,
+            components.apply_btn,
+        ],
+    )
+    components.restore_btn.click(
+        fn=ui_restore_backup,
+        inputs=[
+            components.file_path_box,
+            components.start_line_box,
+            components.end_line_box,
+            components.candidate_code_state,
+            components.backend_radio,
+        ],
+        outputs=[
+            components.code_preview,
+            components.file_status_md,
+            components.apply_status_md,
+            components.apply_btn,
+        ],
+    )
+
+    # 推理生成事件
+    gen_inputs = components.get_gen_inputs()
+    gen_outputs = components.get_gen_outputs()
+
+    submit_ev = components.msg_box.submit(
+        fn=append_user_message,
+        inputs=[components.msg_box, components.chatbot],
+        outputs=[components.msg_box, components.chatbot],
+        queue=False,
+    ).then(
+        fn=generate_response,
+        inputs=gen_inputs,
+        outputs=gen_outputs,
+        concurrency_limit=1,
+    )
+
+    click_ev = components.send_btn.click(
+        fn=append_user_message,
+        inputs=[components.msg_box, components.chatbot],
+        outputs=[components.msg_box, components.chatbot],
+        queue=False,
+    ).then(
+        fn=generate_response,
+        inputs=gen_inputs,
+        outputs=gen_outputs,
+        concurrency_limit=1,
+    )
+
+    autofix_ev = components.autofix_btn.click(
+        fn=prepare_autofix_prompt,
+        inputs=[components.syntax_err_state],
+        outputs=[components.msg_box],
+        queue=False,
+    ).then(
+        fn=append_user_message,
+        inputs=[components.msg_box, components.chatbot],
+        outputs=[components.msg_box, components.chatbot],
+        queue=False,
+    ).then(
+        fn=generate_response,
+        inputs=gen_inputs,
+        outputs=gen_outputs,
+        concurrency_limit=1,
+    )
+
+    # 停止生成與清空對話
+    components.stop_btn.click(
+        fn=None,
+        inputs=[],
+        outputs=[],
+        cancels=[submit_ev, click_ev, autofix_ev],
+    )
+    components.clear_chat_btn.click(
+        fn=lambda: [],
+        inputs=[],
+        outputs=[components.chatbot],
+        queue=False,
+    )
+
+
+def main() -> None:
+    """工作台啟動主流程。"""
+    logger.info(
+        "配置：local_model=%s endpoint=%s num_ctx=%s cloud_model=%s",
+        MODEL_NAME,
+        OLLAMA_URL,
+        NUM_CTX,
+        CLOUD_MODEL,
+    )
+
+    # 本地模型環境預檢
+    preflight()
+
+    # 端口佔用預檢
+    if not port_available(SERVER_NAME, SERVER_PORT):
+        logger.error(
+            "端口 %s:%s 已被占用，可通过 GRADIO_SERVER_PORT 指定其他端口",
+            SERVER_NAME,
+            SERVER_PORT,
+        )
+        sys.exit(1)
+
+    # 自動掃描並載入 Skills
+    loaded_skills = skill_registry.scan_skills()
+    logger.info("已自動載入 %d 個 Skills: %s", loaded_skills, list(skill_registry._skills.keys()))
+
+    # 建立 UI、綁定事件並啟動服務
+    demo, components = build_ui()
+    with demo:
+        bind_events(components)
+
+    # 掛載外部 HTTP RESTful API 路由（支援外部微服務或客戶端調用 Skills）
+    demo.app.include_router(create_skill_router(skill_registry))
+
+    demo.launch(server_name=SERVER_NAME, server_port=SERVER_PORT, show_error=True)
+
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    main()
