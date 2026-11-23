@@ -636,21 +636,54 @@ def find_matching_skills(query: str, max_skills: int = 1) -> List[Any]:
 _GAN_CHARS = "甲乙丙丁戊己庚辛壬癸"
 _ZHI_CHARS = "子丑寅卯辰巳午未申酉戌亥"
 _PILLAR_RE = re.compile(rf"[{_GAN_CHARS}][{_ZHI_CHARS}]")
-_DT_RE = re.compile(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?(?:[^\d]{0,6}(\d{1,2})[:点時时](\d{1,2})?)?")
+_DT_RE = re.compile(
+    r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})\s*日?"
+    r"(?:[^\d子丑寅卯辰巳午未申酉戌亥]{0,6}"
+    r"(?:(\d{1,2})\s*[:点時时]\s*(\d{1,2})?|([子丑寅卯辰巳午未申酉戌亥])\s*[時时]?))?"
+)
+_SHICHEN_TO_HOUR: Dict[str, int] = {
+    "子": 0,
+    "丑": 2,
+    "寅": 4,
+    "卯": 6,
+    "辰": 8,
+    "巳": 10,
+    "午": 12,
+    "未": 14,
+    "申": 16,
+    "酉": 18,
+    "戌": 20,
+    "亥": 22,
+}
+
+
+def _parse_datetime_from_query(q: str) -> Optional[str]:
+    dt_match = _DT_RE.search(q)
+    if not dt_match:
+        return None
+    y, m, d, hh, mm, shichen = dt_match.groups()
+    if hh is not None:
+        hour = int(hh)
+        minute = int(mm or 0)
+    elif shichen is not None:
+        hour = _SHICHEN_TO_HOUR.get(shichen, 12)
+        minute = 0
+    else:
+        hour = 12
+        minute = 0
+    return f"{int(y):04d}-{int(m):02d}-{int(d):02d} {hour:02d}:{minute:02d}"
 
 
 def _extract_cli_args_for_script(skill_name: str, script_rel: str, user_query: str) -> Optional[List[str]]:
     q = user_query.strip()
     pillars = _PILLAR_RE.findall(q)
-    dt_match = _DT_RE.search(q)
+    dt_str = _parse_datetime_from_query(q)
 
     if "bazi" in script_rel or skill_name == "yuanhai-ziping-bazi":
         gender = "F" if any(w in q for w in ("女命", "坤造", "女", "女生")) else "M"
         if len(pillars) >= 4:
             return ["--pillars", " ".join(pillars[:4]), "--gender", gender]
-        if dt_match and "农历" not in q and "農曆" not in q:
-            y, m, d, hh, mm = dt_match.groups()
-            dt_str = f"{int(y):04d}-{int(m):02d}-{int(d):02d} {int(hh or 12):02d}:{int(mm or 0):02d}"
+        if dt_str and "农历" not in q and "農曆" not in q:
             return ["--datetime", dt_str, "--gender", gender]
         return None
 
@@ -661,17 +694,20 @@ def _extract_cli_args_for_script(skill_name: str, script_rel: str, user_query: s
                 return ["--pillars", " ".join(pillars[:4]), "--jieqi", jq_m.group(1)]
             logger.info("奇門排盤缺少節氣參數（如小暑/冬至），跳過腳本預執行")
             return None
-        if dt_match and "农历" not in q and "農曆" not in q:
-            y, m, d, hh, mm = dt_match.groups()
-            dt_str = f"{int(y):04d}-{int(m):02d}-{int(d):02d} {int(hh or 12):02d}:{int(mm or 0):02d}"
+        if dt_str and "农历" not in q and "農曆" not in q:
             return ["--datetime", dt_str]
         return None
 
     if "xuankong" in script_rel or skill_name == "xuankong-bazhai-master":
-        shan_m = re.search(r"坐([壬子癸丑艮寅甲卯乙辰巽巳丙午丁未坤申庚酉辛戌乾亥])", q)
+        shan_m = re.search(
+            r"(?:坐([壬子癸丑艮寅甲卯乙辰巽巳丙午丁未坤申庚酉辛戌乾亥])"
+            r"|([壬子癸丑艮寅甲卯乙辰巽巳丙午丁未坤申庚酉辛戌乾亥])山)",
+            q,
+        )
         year_m = re.search(r"(19\d{2}|20\d{2})\s*年?(?:建|造|竣工|入伙)?", q)
         if shan_m and year_m:
-            args = ["--shan", shan_m.group(1), "--year", year_m.group(1)]
+            shan_val = shan_m.group(1) or shan_m.group(2)
+            args = ["--shan", shan_val, "--year", year_m.group(1)]
             jian_m = re.search(r"兼.*?(\d+(?:\.\d+)?)\s*度", q)
             if jian_m:
                 args.extend(["--jian", jian_m.group(1)])
@@ -679,7 +715,6 @@ def _extract_cli_args_for_script(skill_name: str, script_rel: str, user_query: s
         return None
 
     return None
-
 
 def run_skill_scripts(skill: Any, user_query: str) -> str:
     """執行 Skill 附帶的確定性計算腳本，強制 UTF-8 編碼避免 Windows GBK 亂碼。"""

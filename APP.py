@@ -2,7 +2,6 @@
 """
 app.py: 程式總入口，負責初始化、串接 UI 與 Backend 邏輯並啟動服務。
 """
-
 from __future__ import annotations
 
 import sys
@@ -19,6 +18,13 @@ from config import (
     SERVER_PORT,
     logger,
 )
+from history_store import (
+    append_message,
+    delete_session,
+    list_session_choices,
+    load_messages,
+    new_session_id,
+)
 from skill_manager import create_skill_router, skill_registry
 from ui import UIComponents, build_ui
 from utils import (
@@ -32,8 +38,66 @@ from utils import (
 )
 
 
+def _persist_turn(session_id: str, user_text: str, latest_history: Optional[List[dict]]) -> str:
+    """将本轮用户提问与最新一条助手回复追加写入本地 .jsonl 文件"""
+    active_sid = session_id or new_session_id()
+    if user_text:
+        append_message(active_sid, "user", user_text)
+    if latest_history:
+        last_msg = latest_history[-1]
+        if isinstance(last_msg, dict) and last_msg.get("role") == "assistant":
+            assistant_text = str(last_msg.get("content") or "")
+            if assistant_text:
+                append_message(active_sid, "assistant", assistant_text)
+    return active_sid
+
+
+def _dropdown_update(active_sid: Optional[str] = None):
+    """刷新历史会话下拉框选项"""
+    choices = list_session_choices()
+    valid_ids = {sid for _, sid in choices}
+    selected = active_sid if (active_sid and active_sid in valid_ids) else None
+    return gr.update(choices=choices, value=selected)
+
+
+def on_new_session():
+    """点击“新建会话”：生成全新 ID、清空对话框与暂存状态、刷新下拉列表"""
+    fresh_id = new_session_id()
+    return (
+        fresh_id,
+        [],
+        "",
+        gr.Button(interactive=False),
+        _dropdown_update(None),
+    )
+
+
+def on_refresh_sessions(current_sid: str):
+    """刷新历史会话下拉列表"""
+    return _dropdown_update(current_sid)
+
+
+def on_load_session(selected_sid: str, current_sid: str):
+    """点击“加载”：把选中历史还原到聊天窗口，并将活跃会话切到该历史 ID"""
+    if not selected_sid:
+        return current_sid, gr.skip()
+    msgs = load_messages(selected_sid, as_tuples=False)
+    return selected_sid, msgs
+
+
+def on_delete_session(selected_sid: str, current_sid: str):
+    """点击“删除”：删除选中本地记录；若删的是当前会话则自动切回全新会话"""
+    if not selected_sid:
+        return current_sid, gr.skip(), gr.skip()
+    delete_session(selected_sid)
+    if selected_sid == current_sid:
+        return new_session_id(), [], _dropdown_update(None)
+    return current_sid, gr.skip(), _dropdown_update(current_sid)
+
+
 def unified_submit_pipeline(
     message: str,
+    session_id: str,
     history: Optional[List[dict]],
     raw_path: str,
     start_line: float,
@@ -49,15 +113,18 @@ def unified_submit_pipeline(
     staged_chart: str,
 ):
     """
-    統一單步流式入口：彻底消除兩步 .then() 導致的清屏閃動與丟字。
-    輸出順序：(msg_box, chatbot, staged_chart_state, submit_analysis_btn, *gen_outputs)
+    統一單步流式入口：彻底消除兩步 .then() 導致的清屏閃動與丟字，並自動落盤本地聊天記錄。
+    輸出順序：(msg_box, session_state, history_dropdown, chatbot, staged_chart_state, submit_analysis_btn, *gen_outputs[1:])
     """
     clean_msg = (message or "").strip()
     current_history = list(history or [])
+    active_sid = session_id or new_session_id()
 
     if not clean_msg:
         yield (
             "",
+            active_sid,
+            gr.skip(),
             current_history,
             staged_chart,
             gr.Button(interactive=bool((staged_chart or "").strip())),
@@ -85,8 +152,11 @@ def unified_submit_pipeline(
         current_history.append(
             {"role": "assistant", "content": f"{staged_text}\n\n> {tip}"}
         )
+        active_sid = _persist_turn(active_sid, clean_msg, current_history)
         yield (
             "",
+            active_sid,
+            _dropdown_update(active_sid),
             current_history,
             staged_text,
             gr.Button(interactive=True),
@@ -106,6 +176,8 @@ def unified_submit_pipeline(
     current_history.append({"role": "user", "content": clean_msg})
     yield (
         "",
+        active_sid,
+        gr.skip(),
         current_history,
         "",
         gr.Button(interactive=False),
@@ -121,6 +193,7 @@ def unified_submit_pipeline(
     )
 
     # 3. 緊接在同一生成器內流式輸出模型回覆
+    final_history = current_history
     for gen_out in generate_response(
         history=current_history,
         raw_path=raw_path,
@@ -136,7 +209,10 @@ def unified_submit_pipeline(
         cloud_model=cloud_model,
         staged_chart="",
     ):
+        final_history = gen_out[0]
         yield (
+            gr.skip(),
+            active_sid,
             gr.skip(),
             gen_out[0],
             "",
@@ -144,8 +220,29 @@ def unified_submit_pipeline(
             *gen_out[1:],
         )
 
+    # 4. 流式生成完整結束後，追加落盤並刷新下拉框
+    active_sid = _persist_turn(active_sid, clean_msg, final_history)
+    yield (
+        gr.skip(),
+        active_sid,
+        _dropdown_update(active_sid),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+    )
+
 
 def unified_analysis_pipeline(
+    session_id: str,
     history: Optional[List[dict]],
     raw_path: str,
     start_line: float,
@@ -160,10 +257,14 @@ def unified_analysis_pipeline(
     cloud_model: str,
     staged_chart: str,
 ):
-    """點擊【提交分析】的單步流式入口。"""
+    """點擊【提交分析】的單步流式入口，完成後同步落盤。"""
     current_history = list(history or [])
+    active_sid = session_id or new_session_id()
+
     if not (staged_chart or "").strip():
         yield (
+            active_sid,
+            gr.skip(),
             current_history,
             "",
             gr.Button(interactive=False),
@@ -179,8 +280,11 @@ def unified_analysis_pipeline(
         )
         return
 
-    current_history.append({"role": "user", "content": "已核对暂存盘面，请提交分析。"})
+    trigger_msg = "已核对暂存盘面，请提交分析。"
+    current_history.append({"role": "user", "content": trigger_msg})
     yield (
+        active_sid,
+        gr.skip(),
         current_history,
         staged_chart,
         gr.Button(interactive=False),
@@ -195,6 +299,7 @@ def unified_analysis_pipeline(
         gr.skip(),
     )
 
+    final_history = current_history
     for gen_out in generate_response(
         history=current_history,
         raw_path=raw_path,
@@ -210,16 +315,73 @@ def unified_analysis_pipeline(
         cloud_model=cloud_model,
         staged_chart=staged_chart,
     ):
+        final_history = gen_out[0]
         yield (
+            active_sid,
+            gr.skip(),
             gen_out[0],
             staged_chart,
             gr.skip(),
             *gen_out[1:],
         )
 
+    active_sid = _persist_turn(active_sid, trigger_msg, final_history)
+    yield (
+        active_sid,
+        _dropdown_update(active_sid),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+        gr.skip(),
+    )
 
-def bind_events(components: UIComponents) -> None:
+
+def bind_events(
+    components: UIComponents,
+    session_state: gr.State,
+    new_session_btn: gr.Button,
+    history_dropdown: gr.Dropdown,
+    load_session_btn: gr.Button,
+    refresh_session_btn: gr.Button,
+    delete_session_btn: gr.Button,
+) -> None:
     """串接 UI 元件事件至後端邏輯與工具函式。"""
+    # 歷史會話控制事件
+    new_session_btn.click(
+        fn=on_new_session,
+        inputs=[],
+        outputs=[
+            session_state,
+            components.chatbot,
+            components.staged_chart_state,
+            components.submit_analysis_btn,
+            history_dropdown,
+        ],
+    )
+    refresh_session_btn.click(
+        fn=on_refresh_sessions,
+        inputs=[session_state],
+        outputs=[history_dropdown],
+    )
+    load_session_btn.click(
+        fn=on_load_session,
+        inputs=[history_dropdown, session_state],
+        outputs=[session_state, components.chatbot],
+    )
+    delete_session_btn.click(
+        fn=on_delete_session,
+        inputs=[history_dropdown, session_state],
+        outputs=[session_state, components.chatbot, history_dropdown],
+    )
+
     components.tech_web_cb.change(
         fn=lambda checked: gr.Checkbox(value=True) if checked else gr.skip(),
         inputs=[components.tech_web_cb],
@@ -305,9 +467,11 @@ def bind_events(components: UIComponents) -> None:
     send_ev = gr.on(
         triggers=[components.msg_box.submit, components.send_btn.click],
         fn=unified_submit_pipeline,
-        inputs=[components.msg_box, *gen_inputs],
+        inputs=[components.msg_box, session_state, *gen_inputs],
         outputs=[
             components.msg_box,
+            session_state,
+            history_dropdown,
             components.chatbot,
             components.staged_chart_state,
             components.submit_analysis_btn,
@@ -318,8 +482,10 @@ def bind_events(components: UIComponents) -> None:
 
     submit_analysis_ev = components.submit_analysis_btn.click(
         fn=unified_analysis_pipeline,
-        inputs=gen_inputs,
+        inputs=[session_state, *gen_inputs],
         outputs=[
+            session_state,
+            history_dropdown,
             components.chatbot,
             components.staged_chart_state,
             components.submit_analysis_btn,
@@ -349,8 +515,12 @@ def bind_events(components: UIComponents) -> None:
         outputs=[],
         cancels=[send_ev, submit_analysis_ev, autofix_ev],
     )
+
+    # 「清空对话」：封存当前会话到历史列表，开启新会话（绝不删除本地历史文件）
     components.clear_chat_btn.click(
         fn=lambda: (
+            new_session_id(),
+            gr.update(choices=list_session_choices(), value=None),
             [],
             "",
             gr.Button(interactive=False),
@@ -363,6 +533,8 @@ def bind_events(components: UIComponents) -> None:
         ),
         inputs=[],
         outputs=[
+            session_state,
+            history_dropdown,
             components.chatbot,
             components.staged_chart_state,
             components.submit_analysis_btn,
@@ -401,7 +573,32 @@ def main() -> None:
 
     demo, components = build_ui()
     with demo:
-        bind_events(components)
+        # 每次啟動網頁或重新整理頁面時，都會初始化一個全新的 session_id
+        session_state = gr.State(value=new_session_id)
+
+        with gr.Accordion("历史会话记录（点击展开加载 / 管理本地存档）", open=False):
+            with gr.Row():
+                new_session_btn = gr.Button("＋ 新建会话", size="sm", scale=1)
+                history_dropdown = gr.Dropdown(
+                    label="选择本地历史会话",
+                    choices=list_session_choices(),
+                    value=None,
+                    interactive=True,
+                    scale=5,
+                )
+                load_session_btn = gr.Button("加载", size="sm", scale=1)
+                refresh_session_btn = gr.Button("刷新", size="sm", scale=1)
+                delete_session_btn = gr.Button("删除", size="sm", variant="stop", scale=1)
+
+        bind_events(
+            components=components,
+            session_state=session_state,
+            new_session_btn=new_session_btn,
+            history_dropdown=history_dropdown,
+            load_session_btn=load_session_btn,
+            refresh_session_btn=refresh_session_btn,
+            delete_session_btn=delete_session_btn,
+        )
 
     demo.app.include_router(create_skill_router(skill_registry))
 
